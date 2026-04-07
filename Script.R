@@ -2,8 +2,8 @@
 # TITLE:       The Hidden Economic Burden of Disease-Based Inequity:
 #              A Synthetic Counterfactual Analysis via Tabular Diffusion Models
 # DATA:        Survey of Health, Ageing and Retirement in Europe (SHARE)
-# AUTHORS:     Pietro Grassi, Edoardo Paperi, PhD Chiara Seghieri
-# DATE:        March 2026
+# AUTHORS:     Pietro Grassi, Edoardo Paperi, Chiara Seghieri, Daniele Vignoli
+# DATE:        April 2026
 # ==============================================================================
 
 rm(list=ls())
@@ -80,7 +80,7 @@ df_eol <- map_dfr(files_xt, function(f) {
       TRUE ~ NA_character_ 
     ),
     
-    # --- Palliative Care Access and Cause of Death ---
+    # --- Palliative Care Access and Cause of Death Classification ---
     palliative_access = case_when(
       raw_pall_col == 1 ~ 1, 
       raw_pall_col == 5 ~ 0, 
@@ -120,14 +120,15 @@ message(">>> Total target deceased population identified: ", nrow(df_eol))
 # ------------------------------------------------------------------------------
 # 2. SOCIO-ECONOMIC & DEMOGRAPHIC EXTRACTION (GV_IMPUTATIONS)
 # ------------------------------------------------------------------------------
-message(">>> Ingesting SHARE Multiple Imputation datasets...")
+message(">>> Ingesting SHARE gv_imputations datasets...")
 files_gv_imp <- dir_ls(path = input_dir, regexp = "sharew.*_gv_imputations\\.dta$")
 
 df_imputations <- map_dfr(files_gv_imp, function(f) {
   w <- as.numeric(str_extract(f, "(?<=sharew)\\d+"))
   if (!is.na(w) && w %in% c(6, 7, 8)) {
     read_dta(f) %>%
-      select(mergeid, implicat, thinc2, hnetw, isced, age, gender, mstat, nchild, exrate) %>%
+      select(mergeid, implicat, thinc2, hnetw, isced, age, gender, mstat, nchild, exrate, 
+             otrf, fdistress, chronic) %>%
       mutate(wave = w)
   } else { return(tibble()) }
 }) %>%
@@ -146,9 +147,6 @@ last_wave_imp <- df_imputations %>%
 df_imputations_last <- df_imputations %>%
   inner_join(last_wave_imp, by = c("mergeid", "wave" = "max_wave")) %>%
   mutate(
-    # --- PULIZIA DEI CODICI MISSING DA GV_IMPUTATIONS ---
-    # Trasformiamo in NA i valori negativi (es. -99) che indicano dato mancante.
-    # ATTENZIONE: non tocchiamo 'hnetw', perché lì i valori negativi indicano debiti reali.
     nchild = if_else(nchild < 0, NA_real_, nchild)
   )
 
@@ -156,12 +154,15 @@ df_raw_merged <- df_eol %>%
   inner_join(df_imputations_last, by = "mergeid") %>%
   mutate(
     exrate = coalesce(exrate, 1),
-    oop_costs = oop_costs / exrate
+    oop_costs = oop_costs / exrate,
+    owner = if_else(otrf == 1, 1, 0),
+    fdistress_inv = 5 - fdistress 
   ) %>%
   select(
     mergeid, country, wave_death,
     age, gender, isced, mstat, nchild, thinc2, hnetw, eol_adl_score, 
-    cod_trajectory, welfare_group, palliative_access,                                
+    cod_trajectory, welfare_group, palliative_access, 
+    owner, fdistress_inv, chronic,
     time_help_cat, help_hrs_day_cont, oop_costs                                  
   )
 
@@ -170,7 +171,6 @@ df_raw_merged <- df_eol %>%
 # ------------------------------------------------------------------------------
 message(">>> Performing Missingness Audit on raw merged cohort...")
 
-# Calcoliamo la percentuale di missingness sull'intero dataset grezzo (PRIMA di imputare o droppare)
 missing_pct <- sapply(df_raw_merged, function(x) sum(is.na(x)) / nrow(df_raw_merged) * 100)
 missing_df <- data.frame(Variable = names(missing_pct), Missing_Pct = round(missing_pct, 2))
 print(missing_df)
@@ -182,27 +182,26 @@ df_filtered <- df_raw_merged
 # ------------------------------------------------------------------------------
 message(">>> Performing Multivariate Imputation by Chained Equations (MICE)...")
 
-# Prepariamo il dataframe per MICE:
+# Prepare dataframe for imputation
 df_for_mice <- df_filtered %>% 
   select(-mergeid) %>%
   mutate(across(where(haven::is.labelled), ~ as.numeric(haven::zap_labels(.)))) %>%
   mutate(across(where(is.character), as.factor))
 
-# IMPUTAZIONE MULTIPLA: m = 10 è necessario per calcolare la varianza tra imputazioni (FMI)
+# Multiple imputation (m=10 required for accurate FMI calculation)
 m_imputations <- 10
 imputed_data <- mice(df_for_mice, m = m_imputations, method = 'pmm', seed = 2026, printFlag = FALSE)
 
 message(">>> Extracting Fraction of Missing Information (FMI) for core outcomes...")
 
-# La FMI è parametro-specifica. Fittiamo due modelli diagnostici di base 
-# sulle m imputazioni per valutare quanta incertezza l'imputazione ha aggiunto.
+# FMI is parameter-specific. Fit baseline diagnostic models across the m imputations
 fit_oop <- with(imputed_data, lm(oop_costs ~ age + gender + eol_adl_score))
 fit_hrs <- with(imputed_data, lm(help_hrs_day_cont ~ age + gender + eol_adl_score))
 
 pool_oop <- pool(fit_oop)
 pool_hrs <- pool(fit_hrs)
 
-# Estraiamo la FMI per i coefficienti dei modelli
+# Extract FMI for model coefficients
 fmi_oop <- summary(pool_oop, type = "all") %>% select(term, fmi) %>% mutate(Model = "OOP Costs Diagnostic")
 fmi_hrs <- summary(pool_hrs, type = "all") %>% select(term, fmi) %>% mutate(Model = "Care Hours Diagnostic")
 
@@ -212,12 +211,11 @@ fmi_table <- bind_rows(fmi_oop, fmi_hrs) %>%
 
 print(fmi_table)
 
-# Calcoliamo una FMI media (da citare eventualmente nel paper)
+# Calculate average FMI across models
 mean_fmi <- mean(fmi_table$fmi, na.rm = TRUE)
 message(sprintf(">>> AVERAGE FMI ACROSS DIAGNOSTIC MODELS: %.2f%%", mean_fmi * 100))
 
-# Ricostruiamo il dataset finale estraendo la prima imputazione per l'addestramento 
-# del modello generativo TabDDPM (che richiede un singolo manifold di partenza)
+# Extract the first imputed dataset to train the TabDDPM generative model
 df_complete <- complete(imputed_data, 1)
 
 df_final <- df_complete %>%
@@ -321,7 +319,7 @@ shadow_wages <- df_lci %>%
 
 df_cf <- df_cf %>%
   left_join(shadow_wages, by = "country") %>%
-  mutate(hourly_wage = coalesce(as.numeric(hourly_wage), 15.0)) # Fallback imputation
+  mutate(hourly_wage = coalesce(as.numeric(hourly_wage), 15.0)) # Fallback imputation for missing sector wages
 
 message(">>> Applying physiological capping and 1% winsorization to bound variance...")
 
@@ -337,7 +335,7 @@ winsorize_1pct <- function(x) {
 
 df_econ <- df_cf %>%
   mutate(
-    # Capping informal care
+    # Cap informal care at physiological limits
     real_care_hours = pmin(real_care_hours, MAX_HOURS_YEAR),
     synth_care_hours = pmin(synth_care_hours, MAX_HOURS_YEAR),
     
@@ -381,8 +379,6 @@ message(">>> Generating Table 1 (Descriptive Statistics for Empirical and ATE Co
 # ==============================================================================
 # 1. EMPIRICAL COHORT (Observed Reality)
 # ==============================================================================
-# Castiamo esplicitamente le variabili in Factor (Categoriche) o Numeric (Continue).
-# In questo modo, datasummary_balance formatterà perfettamente la colonna.
 df_desc_emp <- df_econ %>%
   mutate(
     Palliative_Care = if_else(palliative_access == 1, "Treated", "Untreated"),
@@ -395,21 +391,22 @@ df_desc_emp <- df_econ %>%
     Welfare_Regime = as.factor(welfare_group),
     Cause_of_Death = as.factor(cod_trajectory),
     ADL_Dependency_Score = as.numeric(eol_adl_score),
-    Shadow_Hourly_Wage_Euro = as.numeric(hourly_wage),
+    Homeowner = factor(if_else(owner == 1, "Yes", "No"), levels = c("No", "Yes")),
+    Financial_Distress = as.numeric(fdistress_inv),
+    Comorbidities_N = as.numeric(chronic),
     
-    # Se il paziente era trattato nella realtà, il suo esito reale è salvato in 'synth' (Y1).
-    # Se non era trattato, il suo esito reale è salvato in 'real' (Y0).
+    Shadow_Hourly_Wage_Euro = as.numeric(hourly_wage),
     Observed_OOP_Costs_PPS = as.numeric(if_else(palliative_access == 1, synth_oop_costs_ppp, real_oop_costs_ppp)),
     Observed_Care_Hours = as.numeric(if_else(palliative_access == 1, synth_care_hours, real_care_hours))
   ) %>%
   select(Palliative_Care, Age, Gender, Marital_Status, Education_ISCED, Children_N, 
+         Homeowner, Financial_Distress, Comorbidities_N, 
          Wealth_Quartile, Welfare_Regime, Cause_of_Death, ADL_Dependency_Score, 
          Shadow_Hourly_Wage_Euro, Observed_OOP_Costs_PPS, Observed_Care_Hours)
 
 # ==============================================================================
 # 2. ATE COUNTERFACTUAL COHORT (Universal Scenarios)
 # ==============================================================================
-# Sdoppiamo il dataset per simulare i due mondi paralleli (Tutti senza CP vs Tutti con CP)
 df_desc_ate_y0 <- df_econ %>% 
   mutate(
     Scenario = "Standard Care (Y0)", 
@@ -436,22 +433,25 @@ df_desc_ate <- bind_rows(df_desc_ate_y0, df_desc_ate_y1) %>%
     Welfare_Regime = as.factor(welfare_group),
     Cause_of_Death = as.factor(cod_trajectory),
     ADL_Dependency_Score = as.numeric(eol_adl_score),
+    
+    Homeowner = factor(if_else(owner == 1, "Yes", "No"), levels = c("No", "Yes")),
+    Financial_Distress = as.numeric(fdistress_inv),
+    Comorbidities_N = as.numeric(chronic),
+    
     Shadow_Hourly_Wage_Euro = as.numeric(hourly_wage)
   ) %>%
   select(Scenario, Age, Gender, Marital_Status, Education_ISCED, Children_N, 
+         Homeowner, Financial_Distress, Comorbidities_N, 
          Wealth_Quartile, Welfare_Regime, Cause_of_Death, ADL_Dependency_Score, 
          Shadow_Hourly_Wage_Euro, Potential_OOP_Costs_PPS, Potential_Care_Hours)
 
 # ==============================================================================
 # 3. EXPORT VIA DATASUMMARY_BALANCE
 # ==============================================================================
-# datasummary_balance è la funzione "gold standard" per la Table 1. 
-# Mette N nell'header, calcola le percentuali di colonna e pulisce le variabili continue.
-
 datasummary_balance(
   ~ Palliative_Care,
   data = df_desc_emp,
-  dinm = FALSE,  # Disattiva la colonna delle 'Differences in Means' per pulizia visiva
+  dinm = FALSE,  
   title = "Table 1a: Baseline Characteristics and Observed Outcomes (Empirical Cohort)",
   output = file.path(output_dir, "Table_1a_Empirical_Descriptives.docx")
 )
@@ -498,7 +498,7 @@ message(">>> Estimating Distributional Causal Effects via Quantile Regression...
 df_econ <- df_econ %>%
   mutate(delta_total_burden_jitter = delta_total_burden + runif(n(), min = -1e-4, max = 1e-4))
 
-formula_qte <- delta_total_burden_jitter ~ cod_trajectory + welfare_group + wealth_quartile + age + gender + mstat + eol_adl_score + covid_period
+formula_qte <- delta_total_burden_jitter ~ cod_trajectory + welfare_group + wealth_quartile + age + gender + mstat + eol_adl_score + owner + fdistress_inv + chronic + covid_period
 
 # Estimating conditional quantile models
 qte_50 <- suppressWarnings(rq(formula_qte, tau = 0.50, data = df_econ)) 
@@ -528,9 +528,9 @@ message(">>> Table 3 (QTE Models) successfully exported.")
 # ------------------------------------------------------------------------------
 message(">>> Modeling Conditional Average Treatment Effects...")
 
-formula_cate_oop   <- delta_oop ~ cod_trajectory + welfare_group + wealth_quartile + age + gender + mstat + eol_adl_score + covid_period
-formula_cate_hours <- delta_hours ~ cod_trajectory + welfare_group + wealth_quartile + age + gender + mstat + eol_adl_score + covid_period
-formula_cate_total <- delta_total_burden ~ cod_trajectory + welfare_group + wealth_quartile + age + gender + mstat + eol_adl_score + covid_period
+formula_cate_oop   <- delta_oop ~ cod_trajectory + welfare_group + wealth_quartile + age + gender + mstat + eol_adl_score + owner + fdistress_inv + chronic + covid_period
+formula_cate_hours <- delta_hours ~ cod_trajectory + welfare_group + wealth_quartile + age + gender + mstat + eol_adl_score + owner + fdistress_inv + chronic + covid_period
+formula_cate_total <- delta_total_burden ~ cod_trajectory + welfare_group + wealth_quartile + age + gender + mstat + eol_adl_score + owner + fdistress_inv + chronic + covid_period
 
 # Implementing CR2 Cluster-Robust Standard Errors to account for small intra-national correlation (N_clusters < 40).
 model_oop   <- lm_robust(formula_cate_oop, data = df_econ, clusters = country, se_type = "CR2")
@@ -563,6 +563,9 @@ coef_df <- tidy(model_total) %>%
     term = str_replace_all(term, "age", "Age"),
     term = str_replace_all(term, "mstatSingle", "Marital: Single"),
     term = str_replace_all(term, "eol_adl_score", "ADL Dependency Score"),
+    term = str_replace_all(term, "fdistress_inv", "Financial Distress"),
+    term = str_replace_all(term, "owner", "Home Owner: Yes"),
+    term = str_replace_all(term, "chronic", "Comorbidities"),
     term = str_replace_all(term, "covid_periodDuring COVID-19", "COVID-19 Pandemic"),
     term = factor(term, levels = rev(unique(term)))
   )
@@ -572,13 +575,10 @@ p_forest <- ggplot(coef_df, aes(x = estimate, y = term)) +
   geom_point(color = "#2c3e50", size = 3.5) +
   geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2, color = "#2c3e50", linewidth = 0.8) +
   labs(
-    title = "Institutional and Socioeconomic Heterogeneity of Welfare Loss",
-    subtitle = "Marginal CATE on Total Economic Burden (PPP Adjusted). HC2 95% CI.",
     x = "Effect Size in PPS Euros (€)", y = ""
   ) +
   theme_minimal(base_size = 14) +
-  theme(plot.title = element_text(face = "bold", size = 15),
-        panel.grid.minor = element_blank(),
+  theme(panel.grid.minor = element_blank(),
         axis.text.y = element_text(face = "bold", color = "black", size=11))
 
 ggsave(file.path(output_dir, "Figure_1_CATE_ForestPlot.png"), plot = p_forest, width = 10, height = 6, dpi = 300, bg="white")
@@ -608,7 +608,7 @@ plot_causal_shift <- function(data, col_y0, col_y1, x_label, file_name) {
   df_plot <- df_long %>% filter(Value <= p95)
   
   # ----------------------------------------------------------------------------
-  # SCALATURA DINAMICA ASSE Y (Notazione Scientifica & Custom Breaks)
+  # Dynamic Y-axis scaling (Scientific notation & custom breaks)
   # ----------------------------------------------------------------------------
   val_y0 <- df_plot$Value[df_plot$Cohort == "Standard Care (Y0)"]
   val_y1 <- df_plot$Value[df_plot$Cohort == "Palliative Care (Y1)"]
@@ -620,10 +620,10 @@ plot_causal_shift <- function(data, col_y0, col_y1, x_label, file_name) {
   exponent <- floor(log10(max_dens))
   power_val <- 10^exponent
   
-  # Calcoliamo i breaks manuali. 
+  # Compute manual breaks
   max_scaled_val <- ceiling(max_dens / power_val)
   y_breaks <- seq(0, max_scaled_val, by = 1) 
-  y_breaks_real <- y_breaks * power_val      
+  y_breaks_real <- y_breaks * power_val     
   # ----------------------------------------------------------------------------
   
   p_density <- ggplot(df_plot, aes(x = Value, fill = Cohort, color = Cohort)) +
@@ -638,17 +638,17 @@ plot_causal_shift <- function(data, col_y0, col_y1, x_label, file_name) {
       expand = c(0, 0)
     ) +
     
-    # Asse Y: Forziamo i LIMITI oltre ai breaks, per garantire che l'ultimo numero venga stampato
+    # Y-axis: Enforce limits beyond breaks to ensure the last label renders
     scale_y_continuous(
       breaks = y_breaks_real,
-      limits = c(0, max(y_breaks_real)), # <--- MODIFICA CHIAVE QUI
+      limits = c(0, max(y_breaks_real)), 
       labels = function(x) x / power_val,
-      expand = expansion(mult = c(0, 0.10)) # Il 10% di spazio extra SOPRA l'ultimo numero
+      expand = expansion(mult = c(0, 0.10)) # 10% upper expansion
     ) +
     
     coord_cartesian(xlim = c(-p95 * 0.05, p95)) +
     
-    # Usa parse(text=...) per renderizzare l'esponente matematico
+    # Render mathematical exponent
     labs(
       x = x_label, 
       y = parse(text = paste0("Density~Estimation~(10^", exponent, ")"))
@@ -658,8 +658,6 @@ plot_causal_shift <- function(data, col_y0, col_y1, x_label, file_name) {
     theme(
       legend.position = "top", 
       legend.title = element_blank(),
-      plot.title = element_text(face = "bold", size = 15, margin = margin(b = 5)),
-      plot.subtitle = element_text(color = "grey40", size = 11, margin = margin(b = 15)),
       
       panel.grid.minor = element_blank(),
       panel.grid.major.x = element_blank(), 
@@ -708,7 +706,7 @@ message(">>> Generating Inequity Visualizations (CATE & QTE)...")
 # ==============================================================================
 # PLOT A: INSTITUTIONAL INEQUITY (CATE Eastern Penalty across outcomes)
 # ==============================================================================
-# Estraiamo il coefficiente dell'Est Europa dai tre modelli CATE (OLS Robust)
+# Extract Eastern Europe coefficient from CATE models
 tidy_cate_oop <- tidy(model_oop, conf.int = TRUE) %>% filter(term == "welfare_groupEastern") %>% mutate(Outcome = "Δ OOP Costs (PPS €)")
 tidy_cate_hrs <- tidy(model_hours, conf.int = TRUE) %>% filter(term == "welfare_groupEastern") %>% mutate(Outcome = "Δ Care (Hours)")
 tidy_cate_tot <- tidy(model_total, conf.int = TRUE) %>% filter(term == "welfare_groupEastern") %>% mutate(Outcome = "Δ Net Burden (PPS €)")
@@ -721,20 +719,17 @@ p_cate_eastern <- ggplot(cate_eastern_df, aes(x = Outcome, y = estimate, fill = 
   geom_col(width = 0.6, color = "black", alpha = 0.85) +
   geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.15, linewidth = 0.8) +
   scale_fill_manual(values = c("Δ OOP Costs (PPS €)" = "#c0392b", "Δ Care (Hours)" = "#f39c12", "Δ Net Burden (PPS €)" = "#8e44ad")) +
-  facet_wrap(~ Outcome, scales = "free_y") + # Separa i grafici perché Euro e Ore hanno scale diverse
+  facet_wrap(~ Outcome, scales = "free_y") + # Facet plots to accommodate different scales (Currency vs. Hours)
   scale_y_continuous(labels = comma) +
   labs(
-    title = "Institutional Inequity: The Eastern European Penalty",
-    subtitle = "Marginal Average Treatment Effects (CATE) of transitioning to PC in Eastern Regimes",
     x = "",
     y = "Average Penalty (PPS € / Hours)"
   ) +
   theme_minimal(base_size = 14) +
   theme(
     legend.position = "none",
-    plot.title = element_text(face = "bold", size = 15),
     strip.text = element_text(face = "bold", size = 13),
-    axis.text.x = element_blank(), # Rimuove le label doppie sull'asse X
+    axis.text.x = element_blank(), # Remove redundant X-axis labels
     panel.grid.minor = element_blank(),
     panel.grid.major.x = element_blank(),
     axis.line = element_line(color = "black", linewidth = 0.6),
@@ -746,7 +741,7 @@ ggsave(file.path(output_dir, "Figure_5_CATE_Eastern.png"), plot = p_cate_eastern
 # ==============================================================================
 # PLOT B: CLINICAL INEQUITY (QTE Disease Dynamics)
 # ==============================================================================
-# Estraiamo i coefficienti dai modelli QTE
+# Extract coefficients from QTE models
 suppressWarnings({
   tidy_qte_50 <- tidy(qte_50, se.type = "nid", conf.int = TRUE) %>% mutate(Quantile = "50th (Median)", tau = 0.50)
   tidy_qte_75 <- tidy(qte_75, se.type = "nid", conf.int = TRUE) %>% mutate(Quantile = "75th (Severe)", tau = 0.75)
@@ -771,8 +766,6 @@ p_qte_clinical <- ggplot(qte_clinical_df, aes(x = Quantile, y = estimate, group 
   scale_color_manual(values = c("Organ Failure" = "#e67e22", "Other (Frailty/Dementia)" = "#8e44ad")) +
   scale_y_continuous(labels = comma) +
   labs(
-    title = "Disease-Based Inequity Across Severity Quantiles",
-    subtitle = "Marginal QTE penalty on Net Total Burden compared to Cancer baseline",
     x = "Severity Percentile (Total Economic Burden)",
     y = "Additional Economic Penalty (PPS €)"
   ) +
@@ -780,7 +773,6 @@ p_qte_clinical <- ggplot(qte_clinical_df, aes(x = Quantile, y = estimate, group 
   theme(
     legend.position = "top",
     legend.title = element_blank(),
-    plot.title = element_text(face = "bold", size = 15),
     panel.grid.minor = element_blank(),
     axis.line = element_line(color = "black", linewidth = 0.6),
     axis.ticks = element_line(color = "black")
@@ -806,7 +798,7 @@ for (m in wage_multipliers) {
       sens_delta_total = delta_oop + ((delta_hours * (hourly_wage * m)) / ppp_idx)
     )
   
-  # Bootstrapping coerente con il resto del paper
+  # Consistent bootstrapping procedure
   boot_sens <- boot(df_sens$sens_delta_total, mean_boot, R = 1000)
   ci_sens <- boot.ci(boot_sens, type = "bca")
   
@@ -818,7 +810,7 @@ for (m in wage_multipliers) {
   ))
 }
 
-p_sens <- ggplot(sensitivity_results, aes(x = Multiplier, y = Net_Burden)) + # Rimosso factor() e group=1
+p_sens <- ggplot(sensitivity_results, aes(x = Multiplier, y = Net_Burden)) + 
   geom_ribbon(aes(ymin=CI_Lower, ymax=CI_Upper), fill="#2980b9", alpha=0.2) +
   geom_line(color="#2980b9", linewidth=1.2) +
   geom_point(color="#2c3e50", size=4) +
@@ -827,8 +819,7 @@ p_sens <- ggplot(sensitivity_results, aes(x = Multiplier, y = Net_Burden)) + # R
   labs(
     x = "Market Wage Multiplier (%)", y = "Net ATE (PPS €)"
   ) +
-  theme_minimal(base_size = 14) +
-  theme(plot.title = element_text(face="bold"))
+  theme_minimal(base_size = 14)
 
 ggsave(file.path(output_dir, "Appendix_Fig1_WageSensitivity.png"), plot = p_sens, width = 8, height = 5, dpi = 300, bg="white")
 
@@ -837,7 +828,7 @@ ggsave(file.path(output_dir, "Appendix_Fig1_WageSensitivity.png"), plot = p_sens
 # ==============================================================================
 message(">>> Running COVID-19 Time-Period Robustness Check...")
 
-formula_cate_split <- delta_total_burden ~ cod_trajectory + welfare_group + wealth_quartile + age + gender + mstat + eol_adl_score
+formula_cate_split <- delta_total_burden ~ cod_trajectory + welfare_group + wealth_quartile + age + gender + mstat + eol_adl_score + owner + fdistress_inv + chronic
 
 model_total_pre <- lm_robust(
   formula_cate_split, 
@@ -851,7 +842,7 @@ model_total_covid <- lm_robust(
   clusters = country, se_type = "CR2"
 )
 
-# Estraiamo e puliamo i coefficienti per il grafico
+# Extract and format coefficients for visualization
 tidy_pre <- tidy(model_total_pre) %>% mutate(Period = "Pre-COVID-19 (2016-2019)")
 tidy_covid <- tidy(model_total_covid) %>% mutate(Period = "During COVID-19 (2020-2021)")
 
@@ -865,26 +856,26 @@ coef_covid_df <- bind_rows(tidy_pre, tidy_covid) %>%
     term = str_replace_all(term, "mstatSingle", "Marital: Single"),
     term = str_replace_all(term, "age", "Age"),
     term = str_replace_all(term, "eol_adl_score", "ADL Dependency Score"),
+    term = str_replace_all(term, "fdistress_inv", "Financial Distress"),
+    term = str_replace_all(term, "owner", "Home Owner: Yes"),
+    term = str_replace_all(term, "chronic", "Comorbidities"),
     term = factor(term, levels = rev(unique(term))),
     Period = factor(Period, levels = c("Pre-COVID-19 (2016-2019)", "During COVID-19 (2020-2021)"))
   )
 
-# Generiamo il Forest Plot comparativo
+# Generate comparative Forest Plot
 p_covid_forest <- ggplot(coef_covid_df, aes(x = estimate, y = term, color = Period)) +
   geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
   geom_point(position = position_dodge(width = 0.6), size = 3.5) +
   geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), position = position_dodge(width = 0.6), height = 0.3, linewidth = 0.8) +
   scale_color_manual(values = c("Pre-COVID-19 (2016-2019)" = "#2c3e50", "During COVID-19 (2020-2021)" = "#e74c3c")) +
   labs(
-    title = "Macroeconomic Robustness: Pre-COVID vs. Pandemic EoL Care",
-    subtitle = "Stratified Marginal CATE on Net Economic Burden (PPS €). HC2 95% CI.",
     x = "Effect Size in PPS Euros (€)", y = ""
   ) +
   theme_minimal(base_size = 14) +
   theme(
     legend.position = "top",
     legend.title = element_blank(),
-    plot.title = element_text(face = "bold", size = 15),
     panel.grid.minor = element_blank(),
     axis.text.y = element_text(face = "bold", color = "black", size=11)
   )
@@ -892,5 +883,43 @@ p_covid_forest <- ggplot(coef_covid_df, aes(x = estimate, y = term, color = Peri
 ggsave(file.path(output_dir, "Appendix_Fig2_COVID_Robustness.png"), plot = p_covid_forest, width = 11, height = 7, dpi = 300, bg="white")
 
 message(">>> COVID-19 Robustness Analysis successfully exported.")
+
+# ==============================================================================
+# 12.3 METHODOLOGICAL APPENDIX: UNOBSERVED CONFOUNDING (SENSEMAKR)
+# ==============================================================================
+message(">>> Running Sensemakr for Unobserved Confounding (Cinelli & Hazlett, 2020)...")
+
+if(!require(sensemakr)) install.packages("sensemakr")
+library(sensemakr)
+
+model_total_lm <- lm(formula_cate_total, data = df_econ)
+
+sense_clinical <- sensemakr(model = model_total_lm,
+                            treatment = "cod_trajectoryOther",
+                            benchmark_covariates = "eol_adl_score", 
+                            kd = 1:3)
+
+sink(file.path(output_dir, "Appendix_Sensemakr_Summary.txt"))
+print(summary(sense_clinical))
+sink()
+
+sense_clinical$bounds$bound_label <- c("1x EoL ADL Score", "2x EoL ADL Score", "3x EoL ADL Score")
+
+png(file.path(output_dir, "Appendix_Fig3_Unobserved_Confounding.png"), width = 2400, height = 1800, res = 300)
+par(mar = c(5, 5, 4, 2) + 0.1)
+
+# Expand contour limits to accommodate specific bounds
+plot(sense_clinical, 
+     type = "contour", 
+     lim = 0.15, 
+     xlab = "Partial R2 of Unobserved Confounder with Treatment",
+     ylab = "Partial R2 of Unobserved Confounder with Outcome",
+     cex.main = 1.1,
+     cex.lab = 1.0,
+     cex.axis = 0.9)
+
+dev.off()
+
+message(">>> Sensemakr analysis successfully exported in High Definition.")
 
 message(">>> PIPELINE COMPLETE.")
