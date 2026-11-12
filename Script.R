@@ -1,6 +1,6 @@
 # ==============================================================================
-# TITLE:       The Hidden Economic Burden of Disease-Based Inequity:
-#              A Synthetic Counterfactual Analysis via Tabular Diffusion Models
+# TITLE:       The Broken Shield of European Palliative Care: Evidence from Synthetic
+               Counterfactuals on Out-of-Pocket Expenditures and Informal Care
 # DATA:        Survey of Health, Ageing and Retirement in Europe (SHARE)
 # AUTHORS:     Pietro Grassi, Edoardo Paperi, Chiara Seghieri, Daniele Vignoli
 # DATE:        April 2026
