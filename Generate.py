@@ -1,5 +1,5 @@
 # ==============================================================================
-# TITLE:        Synthetic Data Generation and Full ATE Causal Estimation
+# TITLE:        Synthetic Data Generation and ATE Causal Estimation
 # METHOD:       TabDDPM + Full T-Learner Architecture (Y1 and Y0 prediction)
 # ==============================================================================
 
