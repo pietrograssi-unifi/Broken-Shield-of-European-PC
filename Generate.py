@@ -20,8 +20,8 @@ np.random.seed(2026)
 print(">>> 1. Loading empirical data (Full Cohort)...")
 df = pd.read_csv('share_prepared_for_tabddpm.csv')
 
-categorical_cols = ['welfare_group', 'gender', 'isced', 'mstat', 'cod_trajectory', 'time_help_cat', 'palliative_access']
-continuous_cols = ['age', 'nchild', 'thinc2', 'hnetw', 'eol_adl_score', 'help_hrs_day_cont', 'oop_costs']
+categorical_cols = ['welfare_group', 'gender', 'isced', 'mstat', 'cod_trajectory', 'time_help_cat', 'palliative_access', 'owner']
+continuous_cols = ['age', 'nchild', 'thinc2', 'hnetw', 'eol_adl_score', 'help_hrs_day_cont', 'oop_costs', 'fdistress_inv', 'chronic']
 
 for col in categorical_cols:
     df[col] = df[col].astype(str).str.replace(r'\.0$', '', regex=True)
@@ -75,7 +75,7 @@ df_synth_universe['eol_adl_score'] = np.clip(np.round(df_synth_universe['eol_adl
 # ==============================================================================
 print("\n>>> 4. T-Learner: Training Model Y1 (Treated) and Model Y0 (Untreated)...")
 
-features = ['welfare_group', 'age', 'gender', 'isced', 'mstat', 'nchild', 'thinc2', 'hnetw', 'eol_adl_score', 'cod_trajectory']
+features = ['welfare_group', 'age', 'gender', 'isced', 'mstat', 'nchild', 'thinc2', 'hnetw', 'eol_adl_score', 'cod_trajectory', 'owner', 'fdistress_inv', 'chronic']
 
 # Creiamo le dummies sull'intero universo per evitare disallineamenti di colonne
 X_synth_univ = pd.get_dummies(df_synth_universe[features], drop_first=True).astype(int)
